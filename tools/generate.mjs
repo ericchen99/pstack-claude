@@ -73,6 +73,7 @@ const PROMPT_RUNTIMES = RUNTIMES.filter((runtime) => runtime.prompts);
 const VERSIONED_MANIFESTS = [
   ".claude-plugin/marketplace.json",
   `${PLUGIN}/.claude-plugin/plugin.json`,
+  `${PLUGIN}/plugin.json`,
   ...RUNTIMES.map((runtime) => runtime.manifest),
 ];
 
@@ -694,7 +695,7 @@ export function effortSection(levels, defaultEffort) {
 // The effort agents: one general-purpose worker and one poteto-agent per level.
 // The poteto variants carry poteto-agent's body. Their descriptions name
 // pstack:poteto-agent instead of copying its routing contract, so only the
-// base agent reads as the routing target for /poteto-mode. A description is
+// base agent reads as the delegate /poteto-mode runs spawn. A description is
 // written unquoted, so it must not open with a backtick: strict YAML rejects it.
 export function effortAgents(levels, potetoAgent) {
   const { body } = parseFrontmatter(potetoAgent);
