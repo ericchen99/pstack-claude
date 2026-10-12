@@ -283,7 +283,7 @@
       "upstream": "not-proposed"
     }
   },
-  "cursor-team-kit": {
+  "thermos": {
     "plugins/pstack/skills/thermo-nuclear-code-quality-review/SKILL.md": {
       "kind": "policy",
       "why": "Adds a Report Format section requiring one summary report plus one detail file per subsystem or reviewer.",
