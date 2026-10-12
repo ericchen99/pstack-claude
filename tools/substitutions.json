@@ -37,6 +37,21 @@
       "rationale": "the Task tool is the Agent tool on Claude Code, and the port writes the tool name in backticks"
     },
     {
+      "pattern": "comments from BugBot or others present",
+      "replacement": "comments from a review bot or others present",
+      "rationale": "the port routes any automated PR-review bot, not only Cursor's Bugbot"
+    },
+    {
+      "pattern": "Flag issues found by BugBot or others",
+      "replacement": "Flag issues found by a review bot or others",
+      "rationale": "the port routes any automated PR-review bot, not only Cursor's Bugbot"
+    },
+    {
+      "pattern": "Incorporate BugBot or human threads",
+      "replacement": "Incorporate review-bot or human threads",
+      "rationale": "the port routes any automated PR-review bot, not only Cursor's Bugbot"
+    },
+    {
       "pattern": "subagent_type: \"thermo-nuclear-review-subagent\"",
       "replacement": "subagent_type: \"pstack:thermo-nuclear-review-subagent\"",
       "rationale": "Claude Code dispatches plugin agents by their namespaced name"
