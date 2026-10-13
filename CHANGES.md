@@ -2,6 +2,14 @@
 
 This file is the release changelog, with one `## <version> - <title>` entry per release, newest first. The Cursor-to-Claude rewrite rules live in [`tools/substitutions.json`](tools/substitutions.json), and the [sync boundary](CONTRIBUTING.md#the-sync-boundary) in `CONTRIBUTING.md` defines how a change to upstream's skill content is declared.
 
+## 0.9.83 - workspace pools as an alternative to worktrees
+
+A project that cannot run writers in git worktrees can declare a pool of full clones instead. Each clone keeps its own containers, ports, and secrets, which a worktree does not get. The project lists the clones in `.agents/workspace-pool.json` with a `base` branch, a `prepare` command, and each clone's `id`, `path`, and `env`.
+
+`orch pool status`, `orch pool lease`, and `orch pool release` manage the pool without an `orch init` store. A lease is one file per workspace under `.agents/pool-leases/`, written whole to a private file and hard-linked into place, so two leasers racing for one workspace cannot both win and a crash never leaves half a lease. `lease` is idempotent per holder and skips a workspace that is leased or dirty. When none is left, it names each workspace and why. `release` is idempotent, refuses another holder's lease without `--force`, and warns when it leaves a workspace dirty or off `base`. Leases have no timeout. A coordinator recovers a crashed holder's lease with `--force` after it checks `status`.
+
+The new `poteto-mode` reference `references/workspace-pool.md` says how to detect a pool, lease at spawn, brief the agent, and release. When a pool is declared, it replaces worktrees for every writer and live verifier lane in `poteto-mode`, the Feature, Orchestrate, Autopilot-full, and Autopilot-stack playbooks, and `swarm`.
+
 ## 0.9.82 - restore upstream's checks in two principle skills and run haiku 5.5 on Pi
 
 `principle-attack-the-premise` and `principle-test-behavior-not-implementation` follow upstream's text again. The attack-the-premise Stop rule holds the next fix until the shared premise is written down and a per-actor census exists. When the premise is not about actors, the census is a rerunnable check whose result would differ if the premise were false. Test behavior asks whether a test would still pass if every imported function returned `undefined`, and names five shapes that would. Its keep-list adds an absence-only test that fails when the forbidden effect is injected, and a constant pin on a value promised to users. The `poteto-mode` summaries of both principles follow upstream as well. @johnkattenhorn found the drift in [#253](https://github.com/michael-denyer/pstack-claude/issues/253); the fix is in [#254](https://github.com/michael-denyer/pstack-claude/pull/254).
