@@ -6,6 +6,20 @@ When a pool is declared, it replaces worktrees for every writer and every live v
 
 Below, `orch` stands for `bun <plugin>/skills/poteto-mode/scripts/orch/orch.ts`, where `<plugin>` is the installed plugin root. The pool needs no `orch init` store.
 
+## Declare
+
+```json
+{
+  "base": "main",
+  "prepare": "make up",
+  "workspaces": [
+    { "id": "minty1", "path": "minty1", "env": { "ENV": "1" }, "note": "web on :10000, db minty_1" }
+  ]
+}
+```
+
+A relative `path` resolves from the directory that holds `.agents/`. `env` and `note` are optional. Put the facts an agent needs to run that clone in them, such as its ports, env name, and database. `prepare` is optional.
+
 ## Detect
 
 ```bash
@@ -24,15 +38,18 @@ orch pool lease --holder <unit-or-label> --json
 
 The result names the workspace `id`, its absolute `path`, its `env`, the pool's `base` branch, and the `prepare` command. A lease is idempotent per holder, so a retry returns the same workspace. The command leases only a workspace that is free and clean. `--id <ws>` asks for one workspace by name. Exit 1 means no workspace is available, and the error names each workspace and why. Wait for a release, or report the shortage. Never share a leased workspace.
 
+To hold a workspace out of rotation, lease it with `--id <ws> --holder reserved:<reason>`. Release it with the same holder to return it.
+
 ## Brief
 
-The brief carries the lease. Write these into it:
+The brief carries the lease. `orch pool brief <id>` prints all of the following as one block to paste, plus the workspace's note:
 
 - The absolute workspace path. Run every command with `cd <path> && ...`, because the agent's shell may reset its directory between calls.
 - The `env` variables. Export them for every command that starts the app, its containers, or its tests.
 - The `base` branch. Fetch, then start the work branch from the current `base`.
 - The `prepare` command. Run it once in the workspace before the work starts.
 - The fence. Write only in this workspace. Never read from or write to another pool workspace, and never create a git worktree.
+- The clone's instructions. The agent starts outside the clone, so the clone's `CLAUDE.md` or `AGENTS.md` does not load. Tell it to read that file first.
 
 ## Release
 
