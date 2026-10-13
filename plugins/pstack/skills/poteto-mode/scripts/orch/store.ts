@@ -12,15 +12,11 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { connect } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 
 const UNIT_HEADER = "id\ttrack\tstate\tbranch\tpr\tsha\tbrief";
 const LEDGER_HEADER = "pr\tsha\tverdict\tevidence\tverifier\tts";
-const SLOT_HEADER =
-  "slot\tpath\ttrunk\tdriver\tprobe\tnote\treserved\tunit\tsince";
-const PROBE_TIMEOUT_MS = 300;
 const LOCK_FILE = ".orch.lock";
 const TAKEOVER_DIR = ".orch.lock.takeover";
 const GT_TIMEOUT_MS = 60_000;
@@ -103,60 +99,6 @@ export interface StandingLine {
   readonly line: string;
 }
 
-export type SlotHold =
-  | { readonly kind: "free" }
-  | { readonly kind: "reserved"; readonly reason: string }
-  | { readonly kind: "held"; readonly unit: string; readonly since: string };
-
-export interface Slot {
-  readonly slot: string;
-  readonly path: string;
-  readonly trunk: string;
-  readonly driver: string;
-  readonly probe: number | null;
-  readonly note: string;
-  readonly hold: SlotHold;
-}
-
-export interface SlotView {
-  readonly slot: Slot;
-  readonly branch: string | null;
-  readonly dirty: number | null;
-  readonly behind: number | null;
-  readonly probe: "up" | "down" | null;
-}
-
-export interface SlotClaim {
-  readonly unit: string;
-  readonly slot: Slot;
-}
-
-export type CheckoutOutcome =
-  | { readonly kind: "on-trunk" }
-  | { readonly kind: "kept-reserved" }
-  | { readonly kind: "unreadable" }
-  | { readonly kind: "switched"; readonly from: string }
-  | { readonly kind: "dirty"; readonly branch: string }
-  | { readonly kind: "gt-failed"; readonly branch: string; readonly error: string };
-
-export type SlotRelease =
-  | {
-      readonly kind: "released";
-      readonly slot: Slot;
-      readonly was: string | null;
-      readonly checkout: CheckoutOutcome;
-    }
-  | { readonly kind: "unheld"; readonly unit: string };
-
-export interface SlotBrief {
-  readonly slot: string;
-  readonly checkout: string;
-  readonly trunk: string;
-  readonly note: string;
-  readonly driver: string;
-  readonly standing: readonly StandingLine[];
-}
-
 export type Counts = Readonly<Record<string, number>>;
 
 export interface StatusSummary {
@@ -171,7 +113,6 @@ export interface StatusReport {
   readonly ledger: readonly LedgerEntry[];
   readonly frontier: Frontier;
   readonly gates: readonly Gate[];
-  readonly slots: readonly Slot[];
   readonly summary: StatusSummary;
   readonly changed: string;
 }
@@ -236,26 +177,6 @@ export interface AddStandingParams {
   readonly line: string;
 }
 
-export interface AddSlotParams {
-  readonly slot: string;
-  readonly path: string;
-  readonly trunk?: string;
-  readonly driver?: string;
-  readonly probe?: number;
-  readonly note?: string;
-}
-
-export interface ClaimSlotParams {
-  readonly unit: string;
-  readonly slot?: string;
-  readonly allowDirty: boolean;
-}
-
-export interface ReserveSlotParams {
-  readonly slot: string;
-  readonly reason: string;
-}
-
 export interface OpenStoreOptions {
   readonly force?: boolean;
   readonly gt?: string;
@@ -295,18 +216,6 @@ export interface Store {
   readonly standing: {
     readonly show: () => Promise<readonly StandingLine[]>;
     readonly add: (params: AddStandingParams) => Promise<StandingLine>;
-  };
-  readonly slots: {
-    readonly add: (params: AddSlotParams) => Promise<Slot>;
-    readonly remove: (name: string) => Promise<Slot>;
-    readonly list: (params: {
-      readonly fetch: boolean;
-    }) => Promise<readonly SlotView[]>;
-    readonly claim: (params: ClaimSlotParams) => Promise<SlotClaim>;
-    readonly release: (target: string) => Promise<SlotRelease>;
-    readonly reserve: (params: ReserveSlotParams) => Promise<Slot>;
-    readonly unreserve: (name: string) => Promise<Slot>;
-    readonly brief: (unit: string) => Promise<SlotBrief>;
   };
   readonly status: {
     readonly render: () => Promise<StatusReport>;
@@ -937,250 +846,6 @@ async function readStanding(
     result.push({ number, line: match[2] ?? "" });
   }
   return result;
-}
-
-function slotField(
-  value: string,
-  label: string,
-  required: boolean
-): string {
-  if (/[\t\n\r]/.test(value)) {
-    throw new UserError(`${label} must not contain tabs or newlines`);
-  }
-  if (required && value.trim().length === 0) {
-    throw new UserError(`${label} must not be empty`);
-  }
-  return value;
-}
-
-function trunkName(value: string): string {
-  const trunk = slotField(value, "trunk", true);
-  if (trunk.startsWith("-") || /\s/.test(trunk)) {
-    throw new UserError(`trunk ${trunk} is not a branch name`);
-  }
-  return trunk;
-}
-
-function probePort(value: number, label: string): number {
-  if (!Number.isSafeInteger(value) || value < 1 || value > 65535) {
-    throw new UserError(`${label} must be a TCP port from 1 to 65535`);
-  }
-  return value;
-}
-
-function slotHold(
-  slot: string,
-  reserved: string,
-  unit: string,
-  since: string
-): SlotHold {
-  if (reserved === "" && unit === "" && since === "") {
-    return { kind: "free" };
-  }
-  if (reserved !== "" && unit === "" && since === "") {
-    return { kind: "reserved", reason: reserved };
-  }
-  if (reserved === "" && unit !== "" && since !== "") {
-    return { kind: "held", unit, since };
-  }
-  throw new UserError(`slots.tsv has an invalid holder for slot ${slot}`);
-}
-
-async function readSlots(store: string): Promise<readonly Slot[]> {
-  const file = join(store, "slots.tsv");
-  if (!(await exists(file))) {
-    await requiredFile(join(store, "units.tsv"));
-    return [];
-  }
-  const result: Slot[] = [];
-  for (const row of await readTsv(file, SLOT_HEADER, 9)) {
-    const [slot = "", path = "", trunk = "", driver = "", probe = ""] = row;
-    const [note = "", reserved = "", unit = "", since = ""] = row.slice(5);
-    if (slot === "" || path === "" || trunk === "") {
-      throw new UserError("slots.tsv has a row without a slot, path, or trunk");
-    }
-    if (probe !== "" && !/^[1-9]\d*$/.test(probe)) {
-      throw new UserError(`slots.tsv has an invalid probe for slot ${slot}`);
-    }
-    result.push({
-      slot,
-      path,
-      trunk,
-      driver,
-      probe: probe === "" ? null : probePort(Number(probe), "probe"),
-      note,
-      hold: slotHold(slot, reserved, unit, since),
-    });
-  }
-  const names = new Set(result.map((row) => row.slot));
-  if (names.size !== result.length) {
-    throw new UserError("slots.tsv has duplicate slot names");
-  }
-  const units = result.flatMap((row) =>
-    row.hold.kind === "held" ? [row.hold.unit] : []
-  );
-  if (new Set(units).size !== units.length) {
-    throw new UserError("slots.tsv has a unit holding more than one slot");
-  }
-  return result.sort((left, right) => left.slot.localeCompare(right.slot));
-}
-
-function slotCells(row: Slot): readonly string[] {
-  const hold = row.hold;
-  return [
-    row.slot,
-    row.path,
-    row.trunk,
-    row.driver,
-    row.probe === null ? "" : String(row.probe),
-    row.note,
-    hold.kind === "reserved" ? hold.reason : "",
-    hold.kind === "held" ? hold.unit : "",
-    hold.kind === "held" ? hold.since : "",
-  ];
-}
-
-async function saveSlots(store: string, rows: readonly Slot[]): Promise<void> {
-  const sorted = [...rows].sort((left, right) =>
-    left.slot.localeCompare(right.slot)
-  );
-  await writeTsv(
-    join(store, "slots.tsv"),
-    SLOT_HEADER,
-    sorted.map(slotCells)
-  );
-}
-
-function findSlot(rows: readonly Slot[], name: string): Slot {
-  const row = rows.find((value) => value.slot === name);
-  if (row === undefined) {
-    throw new NotFoundError(`slot ${name} not found`);
-  }
-  return row;
-}
-
-function gitLine(path: string, args: readonly string[]): string | null {
-  try {
-    return execFileSync("git", ["-C", path, ...args], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: GT_TIMEOUT_MS,
-      killSignal: "SIGKILL",
-    }).trimEnd();
-  } catch {
-    return null;
-  }
-}
-
-interface Checkout {
-  readonly branch: string | null;
-  readonly dirty: number | null;
-}
-
-function inspectCheckout(path: string): Checkout {
-  const status = gitLine(path, ["status", "--porcelain"]);
-  return {
-    branch: gitLine(path, ["rev-parse", "--abbrev-ref", "HEAD"]),
-    dirty:
-      status === null
-        ? null
-        : status.split("\n").filter((line) => line.length > 0).length,
-  };
-}
-
-function claimRefusal(
-  row: Slot,
-  checkout: Checkout,
-  allowDirty: boolean
-): string | null {
-  const hold = row.hold;
-  if (hold.kind === "reserved") {
-    return `slot ${row.slot} is reserved: ${hold.reason}`;
-  }
-  if (hold.kind === "held") {
-    return `slot ${row.slot} is held by ${hold.unit} since ${hold.since}`;
-  }
-  if (checkout.branch === null || checkout.dirty === null) {
-    return `slot ${row.slot} has no readable git checkout at ${row.path}`;
-  }
-  if (checkout.branch !== row.trunk) {
-    return `slot ${row.slot} is on branch ${checkout.branch}, not ${row.trunk}; run gt checkout ${row.trunk} --cwd ${row.path}`;
-  }
-  if (checkout.dirty > 0 && !allowDirty) {
-    return `slot ${row.slot} has ${checkout.dirty} uncommitted changes; rerun with --allow-dirty if the worker may share them`;
-  }
-  return null;
-}
-
-function returnToTrunk(row: Slot, gt: string, timeout: number): CheckoutOutcome {
-  if (row.hold.kind === "reserved") {
-    return { kind: "kept-reserved" };
-  }
-  const { branch, dirty } = inspectCheckout(row.path);
-  if (branch === null || dirty === null) {
-    return { kind: "unreadable" };
-  }
-  if (branch === row.trunk) {
-    return { kind: "on-trunk" };
-  }
-  if (dirty > 0) {
-    return { kind: "dirty", branch };
-  }
-  try {
-    execFileSync(
-      gt,
-      ["--no-interactive", "checkout", row.trunk, "--cwd", row.path, "--quiet"],
-      {
-        cwd: row.path,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout,
-        killSignal: "SIGKILL",
-      }
-    );
-  } catch (error) {
-    return { kind: "gt-failed", branch, error: errorMessage(error) };
-  }
-  const after = gitLine(row.path, ["rev-parse", "--abbrev-ref", "HEAD"]);
-  return after === row.trunk
-    ? { kind: "switched", from: branch }
-    : {
-        kind: "gt-failed",
-        branch,
-        error: `checkout is on ${after ?? "an unreadable branch"} after gt checkout`,
-      };
-}
-
-function probeUp(port: number): Promise<boolean> {
-  return new Promise((done) => {
-    const socket = connect({ host: "127.0.0.1", port });
-    const finish = (up: boolean): void => {
-      socket.destroy();
-      done(up);
-    };
-    socket.setTimeout(PROBE_TIMEOUT_MS, () => finish(false));
-    socket.once("connect", () => finish(true));
-    socket.once("error", () => finish(false));
-  });
-}
-
-async function viewSlot(row: Slot, fetch: boolean): Promise<SlotView> {
-  if (fetch) {
-    gitLine(row.path, ["fetch", "--quiet", "origin", row.trunk]);
-  }
-  const { branch, dirty } = inspectCheckout(row.path);
-  const behind = gitLine(row.path, [
-    "rev-list",
-    "--count",
-    `HEAD..refs/remotes/origin/${row.trunk}`,
-  ]);
-  return {
-    slot: row,
-    branch,
-    dirty,
-    behind: behind === null ? null : Number(behind),
-    probe: row.probe === null ? null : (await probeUp(row.probe)) ? "up" : "down",
-  };
 }
 
 function countValues(values: readonly string[]): Counts {
@@ -2011,198 +1676,6 @@ export function openStore(
         return item;
       },
     },
-    slots: {
-      add: async (params) => {
-        await beginWrite();
-        const name = slotField(params.slot, "slot name", true);
-        const path = resolve(slotField(params.path, "path", true));
-        if (!(await exists(path))) {
-          throw new UserError(`path ${path} does not exist`);
-        }
-        if (gitLine(path, ["rev-parse", "--is-inside-work-tree"]) !== "true") {
-          throw new UserError(`path ${path} is not a git work tree`);
-        }
-        const rows = [...(await readSlots(store))];
-        const old = rows.find((row) => row.slot === name);
-        const row: Slot = {
-          slot: name,
-          path,
-          trunk: trunkName(params.trunk ?? old?.trunk ?? "main"),
-          driver:
-            params.driver === undefined
-              ? (old?.driver ?? "")
-              : slotField(params.driver, "driver", false),
-          probe:
-            params.probe === undefined
-              ? (old?.probe ?? null)
-              : probePort(params.probe, "probe"),
-          note:
-            params.note === undefined
-              ? (old?.note ?? "")
-              : slotField(params.note, "note", false),
-          hold: old?.hold ?? { kind: "free" },
-        };
-        await saveSlots(store, [
-          ...rows.filter((value) => value.slot !== name),
-          row,
-        ]);
-        return row;
-      },
-      remove: async (name) => {
-        await beginWrite();
-        const rows = await readSlots(store);
-        const row = findSlot(rows, name);
-        if (row.hold.kind !== "free") {
-          throw new UserError(
-            `slot ${name} is ${row.hold.kind}; only a free slot can be removed`
-          );
-        }
-        await saveSlots(
-          store,
-          rows.filter((value) => value !== row)
-        );
-        return row;
-      },
-      list: async (params) => {
-        ensureOpen();
-        return Promise.all(
-          (await readSlots(store)).map((row) => viewSlot(row, params.fetch))
-        );
-      },
-      claim: async (params) => {
-        await beginWrite();
-        const unit = requiredCell(params.unit, "unit id");
-        if (!(await readUnits(store)).some((row) => row.id === unit)) {
-          throw new NotFoundError(`unit ${unit} not found`);
-        }
-        const rows = await readSlots(store);
-        const holding = rows.find(
-          (row) => row.hold.kind === "held" && row.hold.unit === unit
-        );
-        if (holding !== undefined) {
-          throw new UserError(`unit ${unit} already holds slot ${holding.slot}`);
-        }
-        let chosen: Slot | undefined;
-        if (params.slot === undefined) {
-          chosen = rows.find(
-            (row) =>
-              claimRefusal(
-                row,
-                inspectCheckout(row.path),
-                params.allowDirty
-              ) === null
-          );
-          if (chosen === undefined) {
-            throw new UserError(
-              rows.length === 0
-                ? "no slots; add one with orch slot add"
-                : `no free slot on its trunk${params.allowDirty ? "" : " with a clean tree; try --allow-dirty"}`
-            );
-          }
-        } else {
-          chosen = findSlot(rows, params.slot);
-          const refusal = claimRefusal(
-            chosen,
-            inspectCheckout(chosen.path),
-            params.allowDirty
-          );
-          if (refusal !== null) {
-            throw new UserError(refusal);
-          }
-        }
-        const claimed: Slot = {
-          ...chosen,
-          hold: { kind: "held", unit, since: new Date().toISOString() },
-        };
-        await saveSlots(
-          store,
-          rows.map((row) => (row === chosen ? claimed : row))
-        );
-        return { unit, slot: claimed };
-      },
-      release: async (target) => {
-        await beginWrite();
-        const rows = await readSlots(store);
-        const row =
-          rows.find((value) => value.slot === target) ??
-          rows.find(
-            (value) => value.hold.kind === "held" && value.hold.unit === target
-          );
-        if (row === undefined) {
-          if ((await readUnits(store)).some((unit) => unit.id === target)) {
-            return { kind: "unheld", unit: target };
-          }
-          throw new NotFoundError(`no slot or unit matches ${target}`);
-        }
-        const was = row.hold.kind === "held" ? row.hold.unit : null;
-        const released: Slot =
-          row.hold.kind === "held" ? { ...row, hold: { kind: "free" } } : row;
-        if (released !== row) {
-          await saveSlots(
-            store,
-            rows.map((value) => (value === row ? released : value))
-          );
-        }
-        return {
-          kind: "released",
-          slot: released,
-          was,
-          checkout: returnToTrunk(
-            released,
-            options.gt ?? "gt",
-            options.gtTimeoutMs ?? GT_TIMEOUT_MS
-          ),
-        };
-      },
-      reserve: async (params) => {
-        await beginWrite();
-        const reason = slotField(params.reason, "reason", true);
-        const rows = await readSlots(store);
-        const row = findSlot(rows, params.slot);
-        if (row.hold.kind === "held") {
-          throw new UserError(
-            `slot ${row.slot} is held by ${row.hold.unit}; release it first`
-          );
-        }
-        const reserved: Slot = { ...row, hold: { kind: "reserved", reason } };
-        await saveSlots(
-          store,
-          rows.map((value) => (value === row ? reserved : value))
-        );
-        return reserved;
-      },
-      unreserve: async (name) => {
-        await beginWrite();
-        const rows = await readSlots(store);
-        const row = findSlot(rows, name);
-        if (row.hold.kind !== "reserved") {
-          return row;
-        }
-        const freed: Slot = { ...row, hold: { kind: "free" } };
-        await saveSlots(
-          store,
-          rows.map((value) => (value === row ? freed : value))
-        );
-        return freed;
-      },
-      brief: async (unit) => {
-        ensureOpen();
-        const row = (await readSlots(store)).find(
-          (value) => value.hold.kind === "held" && value.hold.unit === unit
-        );
-        if (row === undefined) {
-          throw new UserError(`unit ${unit} holds no slot; claim one first`);
-        }
-        return {
-          slot: row.slot,
-          checkout: row.path,
-          trunk: row.trunk,
-          note: row.note,
-          driver: row.driver,
-          standing: await readStanding(store),
-        };
-      },
-    },
     status: {
       render: async () => {
         await beginWrite();
@@ -2210,7 +1683,6 @@ export function openStore(
         const ledgerRows = await readLedger(store);
         const currentFrontier = await readFrontier(store);
         const gateRows = await readGates(store);
-        const slotRows = await readSlots(store);
         const currentSummary = summarize(
           unitRows,
           ledgerRows,
@@ -2237,7 +1709,6 @@ export function openStore(
           ledger: ledgerRows,
           frontier: currentFrontier,
           gates: gateRows,
-          slots: slotRows,
           summary: currentSummary,
           changed: change,
         };
@@ -2253,7 +1724,6 @@ export function openStore(
       await writeIfMissing(join(store, "gates.md"), "");
       await writeIfMissing(join(store, "preferences.md"), "");
       await writeIfMissing(join(store, "frontier.json"), "{}\n");
-      await writeIfMissing(join(store, "slots.tsv"), `${SLOT_HEADER}\n`);
       return { store };
     },
     close: async () => {
