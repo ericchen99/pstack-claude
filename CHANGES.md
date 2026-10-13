@@ -2,6 +2,12 @@
 
 This file is the release changelog, with one `## <version> - <title>` entry per release, newest first. The Cursor-to-Claude rewrite rules live in [`tools/substitutions.json`](tools/substitutions.json), and the [sync boundary](CONTRIBUTING.md#the-sync-boundary) in `CONTRIBUTING.md` defines how a change to upstream's skill content is declared.
 
+## 0.9.83 - clone fleets in Orchestrate
+
+Orchestrate gains a clone fleet mode for teams that keep a few fixed full clones of one repository, each with its own environment, ports, and database, and run the coordinator from the folder that holds them. `orch slot` registers each clone as a slot with a trunk, a driver skill, a dev-server probe port, and a free-text note. It claims the first free clone that is on its trunk and clean for a unit, prints the slot block and the standing orders for the brief, and on release returns a clean clone to its trunk through `gt`. A clone with uncommitted work stays out of rotation instead of being cleaned. `slots.tsv` is the store's record of who holds which clone, and a store without it keeps working. In a clone fleet each stack lives in one clone and that slot's worker is its stacker, so it runs `gt` in its own clone only.
+
+A project playbook can live in the folder a coordinator runs from when that folder holds several clones of one repository, not only at a repository root.
+
 ## 0.9.82 - restore upstream's checks in two principle skills and run haiku 5.5 on Pi
 
 `principle-attack-the-premise` and `principle-test-behavior-not-implementation` follow upstream's text again. The attack-the-premise Stop rule holds the next fix until the shared premise is written down and a per-actor census exists. When the premise is not about actors, the census is a rerunnable check whose result would differ if the premise were false. Test behavior asks whether a test would still pass if every imported function returned `undefined`, and names five shapes that would. Its keep-list adds an absence-only test that fails when the forbidden effect is injected, and a constant pin on a value promised to users. The `poteto-mode` summaries of both principles follow upstream as well. @johnkattenhorn found the drift in [#253](https://github.com/michael-denyer/pstack-claude/issues/253); the fix is in [#254](https://github.com/michael-denyer/pstack-claude/pull/254).
