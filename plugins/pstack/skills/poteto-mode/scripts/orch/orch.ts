@@ -18,11 +18,13 @@ import {
 } from "./store.ts";
 import {
   leaseWorkspace,
+  briefWorkspace,
   loadPool,
   poolStatus,
   releaseWorkspace,
   type LeaseGrant,
   type Pool,
+  type WorkspaceBrief,
   type ReleaseResult,
   type WorkspaceStatus,
 } from "./pool.ts";
@@ -218,6 +220,30 @@ function leaseLine(grant: LeaseGrant): string {
     `base=${grant.base}`,
     `prepare=${grant.prepare ?? "-"}`,
   ].join("\t");
+}
+
+function shellWord(value: string): string {
+  return /^[A-Za-z0-9_./:@%+=,-]+$/.test(value)
+    ? value
+    : `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function briefLines(brief: WorkspaceBrief): string {
+  const exports = Object.entries(brief.env).map(
+    ([name, value]) => `export ${name}=${shellWord(value)}`
+  );
+  return [
+    `WORKSPACE    ${brief.id}, leased to ${brief.holder} since ${brief.since}`,
+    `CLONE        ${brief.path}`,
+    `             run every command as cd ${brief.path} && ...`,
+    `ENV          ${exports.length > 0 ? exports.join("; ") : "(none)"}`,
+    `BASE         fetch, then start the work branch from the current ${brief.base}`,
+    `PREPARE      ${brief.prepare === null ? "(none)" : `${brief.prepare}; run it once before the work starts`}`,
+    ...(brief.note === null ? [] : [`NOTE         ${brief.note}`]),
+    `FIRST        read this clone's CLAUDE.md or AGENTS.md; you started outside it, so they did not load`,
+    `FENCE        write only in ${brief.path}; never touch another pool workspace;`,
+    `             never create a git worktree; no gt outside this clone`,
+  ].join("\n");
 }
 
 function releaseLine(result: ReleaseResult): string {
@@ -635,6 +661,10 @@ function createProgram(io: Io): Command {
         leaseLine
       )
     );
+  leaf(pool, "brief <id>", "print a leased workspace's block for a worker brief").action(
+    (id: string) =>
+      runPool(program, pool, io, (loaded) => briefWorkspace(loaded, id), briefLines)
+  );
   leaf(pool, "release <id>", "release a workspace lease")
     .option("--holder <label>", "refuse unless this label holds the lease")
     .action((id: string, options: PoolReleaseOptions) =>

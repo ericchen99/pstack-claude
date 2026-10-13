@@ -186,6 +186,47 @@ describe("orch pool", () => {
     ).toBe("ws2\t<root>/ws2\tENV=2\tbase=main\tprepare=make up\n");
   });
 
+  it("prints a leased workspace's brief block and refuses a free one", async () => {
+    const root = await makePool({
+      ids: ["ws1"],
+      config: {
+        base: "main",
+        workspaces: [
+          {
+            id: "ws1",
+            path: "ws1",
+            env: { ENV: "1", GREETING: "it's on" },
+            note: "web on :10000, db minty1",
+          },
+        ],
+      },
+    });
+    expect(run(root, ["pool", "brief", "ws1"])).toEqual({
+      code: 1,
+      stdout: "",
+      stderr:
+        "error: ws1 is not leased; run orch pool lease --holder <unit> first\n",
+    });
+    run(root, ["pool", "lease", "--holder", "unit-a"]);
+    expect(run(root, ["pool", "brief", "ws1"])).toEqual({
+      code: 0,
+      stdout: [
+        "WORKSPACE    ws1, leased to unit-a since <since>",
+        "CLONE        <root>/ws1",
+        "             run every command as cd <root>/ws1 && ...",
+        "ENV          export ENV=1; export GREETING='it'\\''s on'",
+        "BASE         fetch, then start the work branch from the current main",
+        "PREPARE      (none)",
+        "NOTE         web on :10000, db minty1",
+        "FIRST        read this clone's CLAUDE.md or AGENTS.md; you started outside it, so they did not load",
+        "FENCE        write only in <root>/ws1; never touch another pool workspace;",
+        "             never create a git worktree; no gt outside this clone",
+        "",
+      ].join("\n"),
+      stderr: "",
+    });
+  });
+
   it("releases idempotently and refuses the wrong holder unless forced", async () => {
     const root = await makePool();
     run(root, ["pool", "lease", "--holder", "unit-a"]);

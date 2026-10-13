@@ -477,3 +477,19 @@ export async function releaseWorkspace(
   }
   return { id, ...outcome, warnings };
 }
+
+export type WorkspaceBrief = LeaseGrant & { readonly note: string | null };
+
+export async function briefWorkspace(
+  pool: Pool,
+  id: string
+): Promise<WorkspaceBrief> {
+  const workspace = findWorkspace(pool, id);
+  const lease = await readLease(pool, id);
+  if (lease === null) {
+    throw new UserError(
+      `${id} is not leased; run orch pool lease --holder <unit> first`
+    );
+  }
+  return { ...grant(pool, workspace, lease), note: workspace.note };
+}
