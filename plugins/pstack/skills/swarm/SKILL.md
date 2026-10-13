@@ -34,6 +34,8 @@ Spawn all N workers in one message with `subagent_type: "general-purpose"`, `run
 
 When a worker must start from a non-default branch, check that branch out in the worker's own worktree and name the worktree path in its brief.
 
+When the project declares a workspace pool, a writing worker leases a pool workspace instead of a worktree, per poteto-mode's `references/workspace-pool.md`. Release each lease when its worker finishes or drops out.
+
 Every brief stands alone. Include the goal, scope, exact slice or race arm, how to verify, and what to report. Reports use `PASS`, `ISSUES`, or `BLOCKED` with evidence. A worker that can prove a defect reports `ISSUES` and lists every issue it can prove, not only the first.
 
 If a worker drops out, proceed with N-1 and note it.
