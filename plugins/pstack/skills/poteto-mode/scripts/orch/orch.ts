@@ -16,6 +16,16 @@ import {
   type Unit,
   type Verdict,
 } from "./store.ts";
+import {
+  leaseWorkspace,
+  loadPool,
+  poolStatus,
+  releaseWorkspace,
+  type LeaseGrant,
+  type Pool,
+  type ReleaseResult,
+  type WorkspaceStatus,
+} from "./pool.ts";
 
 ensureDependenciesInstalled();
 const {
@@ -77,6 +87,19 @@ interface GateParkOptions {
 
 interface GateResolveOptions {
   readonly answer: string;
+}
+
+interface PoolOptions {
+  readonly pool?: string;
+}
+
+interface PoolLeaseOptions {
+  readonly holder: string;
+  readonly id?: string;
+}
+
+interface PoolReleaseOptions {
+  readonly holder?: string;
 }
 
 interface FrontierSetOptions {
@@ -172,6 +195,37 @@ function frontierLine(value: Frontier): string {
   return `generation=${value.generation} prs=${prs} lowest-unmerged=${value.lowestUnmerged ?? "none"}`;
 }
 
+function workspaceLine(row: WorkspaceStatus): string {
+  return [
+    row.id,
+    row.state,
+    row.state === "leased" ? row.holder : "-",
+    row.state === "leased" ? row.since : "-",
+    row.branch,
+    row.dirty ? "dirty" : "clean",
+    row.path,
+  ].join("\t");
+}
+
+function leaseLine(grant: LeaseGrant): string {
+  const env = Object.entries(grant.env)
+    .map(([name, value]) => `${name}=${value}`)
+    .join(",");
+  return [
+    grant.id,
+    grant.path,
+    env.length > 0 ? env : "-",
+    `base=${grant.base}`,
+    `prepare=${grant.prepare ?? "-"}`,
+  ].join("\t");
+}
+
+function releaseLine(result: ReleaseResult): string {
+  return result.outcome === "already-free"
+    ? `${result.id}\talready free`
+    : `${result.id}\treleased\t${result.holder ?? "(unreadable lease)"}`;
+}
+
 function statusLines(report: StatusReport): string {
   const visible = report.summary.openGateIds.slice(0, DISPLAY_LIMIT);
   const more =
@@ -239,6 +293,20 @@ async function runStore<T>(
   }
 }
 
+async function runPool<T>(
+  program: Command,
+  pool: Command,
+  io: Io,
+  operation: (pool: Pool) => Promise<T>,
+  compact: (result: T) => string
+): Promise<void> {
+  const loaded = await loadPool({
+    cwd: process.cwd(),
+    file: pool.opts<PoolOptions>().pool,
+  });
+  emit(io, program.opts<GlobalOptions>().json, await operation(loaded), compact);
+}
+
 function leaf(parent: Command, name: string, description: string): Command {
   return parent
     .command(name)
@@ -265,7 +333,11 @@ function createProgram(io: Io): Command {
       )
     )
     .option("--json", "print complete rows as JSON", false)
-    .option("--force", "steal an existing store lock", false);
+    .option(
+      "--force",
+      "steal an existing store lock, or release another holder's lease",
+      false
+    );
 
   leaf(program, "init", "initialize the store").action(() =>
     runStore(
@@ -531,6 +603,59 @@ function createProgram(io: Io): Command {
       (item) => `${item.number}. ${item.line}`
     )
   );
+
+  const pool = program
+    .command("pool")
+    .description("lease workspaces from a declared clone pool (no store needed)")
+    .addOption(
+      new Option(
+        "--pool <file>",
+        "pool config (or PSTACK_POOL; default: nearest .agents/workspace-pool.json)"
+      ).env("PSTACK_POOL")
+    )
+    .action(() => {
+      throw new UsageError("a valid command is required");
+    });
+  leaf(pool, "status", "show each workspace's lease, branch, and cleanliness").action(
+    () =>
+      runPool(program, pool, io, poolStatus, (rows) =>
+        compactRows(rows, workspaceLine, "(no workspaces)", null)
+      )
+  );
+  leaf(pool, "lease", "lease a free clean workspace, or return the holder's own")
+    .requiredOption("--holder <label>", "lease holder, such as a unit id")
+    .option("--id <workspace>", "lease this workspace only")
+    .action((options: PoolLeaseOptions) =>
+      runPool(
+        program,
+        pool,
+        io,
+        (loaded) =>
+          leaseWorkspace(loaded, { holder: options.holder, id: options.id }),
+        leaseLine
+      )
+    );
+  leaf(pool, "release <id>", "release a workspace lease")
+    .option("--holder <label>", "refuse unless this label holds the lease")
+    .action((id: string, options: PoolReleaseOptions) =>
+      runPool(
+        program,
+        pool,
+        io,
+        async (loaded) => {
+          const result = await releaseWorkspace(loaded, {
+            id,
+            holder: options.holder,
+            force: program.opts<GlobalOptions>().force,
+          });
+          for (const warning of result.warnings) {
+            io.stderr(`warning: ${warning}\n`);
+          }
+          return result;
+        },
+        releaseLine
+      )
+    );
 
   program.action(() => requireSubcommand(program));
   return program;
