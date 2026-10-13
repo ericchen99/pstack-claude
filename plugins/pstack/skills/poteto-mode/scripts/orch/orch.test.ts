@@ -295,6 +295,7 @@ describe("Store", () => {
       "inbox",
       "ledger.tsv",
       "preferences.md",
+      "slots.tsv",
       "units.tsv",
     ]);
 
@@ -1338,4 +1339,340 @@ fi
     },
     30_000
   );
+});
+
+interface Fleet {
+  readonly directory: string;
+  readonly store: string;
+  readonly origin: string;
+  readonly bin: string;
+  readonly path: (slot: string) => string;
+  readonly orch: (...args: readonly string[]) => RunResult;
+}
+
+const FAKE_GT_SWITCH = `#!/usr/bin/env bash
+set -euo pipefail
+if [ "$1 $2" != "--no-interactive checkout" ] || [ "$4" != "--cwd" ] || [ "$6" != "--quiet" ]; then
+  printf 'unexpected gt arguments: %s\\n' "$*" >&2
+  exit 2
+fi
+exec git -C "$5" switch --quiet "$3"
+`;
+
+async function makeFleet(slots: readonly string[]): Promise<Fleet> {
+  const directory = await makeDirectory();
+  const store = join(directory, "store");
+  const origin = join(directory, "origin");
+  const bin = join(directory, "bin");
+  await mkdir(origin);
+  await mkdir(bin);
+  git({ repo: origin, args: ["init", "--initial-branch=main"] });
+  git({ repo: origin, args: ["config", "user.name", "Orch Test"] });
+  git({ repo: origin, args: ["config", "user.email", "orch@example.com"] });
+  await writeFile(join(origin, "main.txt"), "main\n");
+  git({ repo: origin, args: ["add", "."] });
+  git({ repo: origin, args: ["commit", "-m", "main"] });
+  await writeFile(join(bin, "gt"), FAKE_GT_SWITCH, { mode: 0o755 });
+  const env = { PATH: `${bin}:${process.env.PATH}`, ORCH_STORE: store };
+  const fleet: Fleet = {
+    directory,
+    store,
+    origin,
+    bin,
+    path: (slot) => join(directory, slot),
+    orch: (...args) => runCli(args, env),
+  };
+  expect(fleet.orch("init").code).toBe(0);
+  for (const slot of slots) {
+    git({ repo: directory, args: ["clone", "--quiet", origin, slot] });
+    expect(fleet.orch("slot", "add", slot, "--path", fleet.path(slot)).code).toBe(
+      0
+    );
+  }
+  for (const unit of ["u1", "u2", "u3"]) {
+    expect(fleet.orch("unit", "add", unit, "--track", "build").code).toBe(0);
+  }
+  return fleet;
+}
+
+async function slotRows(fleet: Fleet): Promise<string> {
+  return (await readFile(join(fleet.store, "slots.tsv"), "utf8")).replace(
+    /\d{4}-\d\d-\d\dT[\d:.]+Z/g,
+    "<since>"
+  );
+}
+
+const SLOT_HEADER =
+  "slot\tpath\ttrunk\tdriver\tprobe\tnote\treserved\tunit\tsince\n";
+
+describe("orch slot", () => {
+  it("claims the first free slot on its trunk with a clean tree, and says why a named slot is refused", async () => {
+    const fleet = await makeFleet(["a", "b", "c"]);
+    git({ repo: fleet.path("a"), args: ["switch", "--quiet", "-c", "feat"] });
+    await writeFile(join(fleet.path("b"), "scratch.txt"), "wip\n");
+
+    expect(fleet.orch("slot", "claim", "u1").stdout).toBe("u1 -> c\n");
+
+    const offTrunk = fleet.orch("slot", "claim", "u2", "--slot", "a");
+    expect(offTrunk.code).toBe(1);
+    expect(offTrunk.stderr).toBe(
+      `error: slot a is on branch feat, not main; run gt checkout main --cwd ${fleet.path("a")}\n`
+    );
+    expect(fleet.orch("slot", "claim", "u2", "--slot", "b").stderr).toBe(
+      "error: slot b has 1 uncommitted changes; rerun with --allow-dirty if the worker may share them\n"
+    );
+    expect(fleet.orch("slot", "claim", "u2", "--slot", "c").stderr).toMatch(
+      /^error: slot c is held by u1 since \d{4}-\d\d-\d\dT[\d:.]+Z\n$/
+    );
+    expect(fleet.orch("slot", "claim", "u2").stderr).toBe(
+      "error: no free slot on its trunk with a clean tree; try --allow-dirty\n"
+    );
+
+    expect(fleet.orch("slot", "claim", "u2", "--allow-dirty").stdout).toBe(
+      "u2 -> b\n"
+    );
+    expect(await slotRows(fleet)).toBe(
+      `${SLOT_HEADER}a\t${fleet.path("a")}\tmain\t\t\t\t\t\t\nb\t${fleet.path("b")}\tmain\t\t\t\t\tu2\t<since>\nc\t${fleet.path("c")}\tmain\t\t\t\t\tu1\t<since>\n`
+    );
+  });
+
+  it("claims only for a known unit that holds no other slot", async () => {
+    const fleet = await makeFleet(["a", "b"]);
+
+    const ghost = fleet.orch("slot", "claim", "ghost");
+    expect(ghost.code).toBe(2);
+    expect(ghost.stderr).toBe("error: unit ghost not found\n");
+    expect(fleet.orch("slot", "claim", "u1").stdout).toBe("u1 -> a\n");
+    const again = fleet.orch("slot", "claim", "u1");
+    expect(again.code).toBe(1);
+    expect(again.stderr).toBe("error: unit u1 already holds slot a\n");
+    expect(fleet.orch("slot", "claim", "u2", "--slot", "missing").stderr).toBe(
+      "error: slot missing not found\n"
+    );
+    expect(await slotRows(fleet)).toBe(
+      `${SLOT_HEADER}a\t${fleet.path("a")}\tmain\t\t\t\t\tu1\t<since>\nb\t${fleet.path("b")}\tmain\t\t\t\t\t\t\n`
+    );
+  });
+
+  it("refuses to reserve a held slot and keeps a reserved slot out of claims", async () => {
+    const fleet = await makeFleet(["a", "b", "c"]);
+    expect(fleet.orch("slot", "claim", "u1").stdout).toBe("u1 -> a\n");
+
+    expect(fleet.orch("slot", "reserve", "a", "pinned").stderr).toBe(
+      "error: slot a is held by u1; release it first\n"
+    );
+    expect(fleet.orch("slot", "reserve", "b", "pinned to v1").stdout).toBe(
+      "b reserved: pinned to v1\n"
+    );
+    expect(fleet.orch("slot", "claim", "u2", "--slot", "b").stderr).toBe(
+      "error: slot b is reserved: pinned to v1\n"
+    );
+    expect(fleet.orch("status").stdout).toContain(
+      "\nslots: 1 held, 1 free, 1 reserved\n"
+    );
+    expect(fleet.orch("slot", "remove", "b").stderr).toBe(
+      "error: slot b is reserved; only a free slot can be removed\n"
+    );
+    expect(fleet.orch("slot", "claim", "u2").stdout).toBe("u2 -> c\n");
+
+    expect(fleet.orch("slot", "unreserve", "b").stdout).toBe(
+      "b back in rotation\n"
+    );
+    expect(fleet.orch("slot", "unreserve", "b").stdout).toBe(
+      "b back in rotation\n"
+    );
+    expect(fleet.orch("slot", "claim", "u3").stdout).toBe("u3 -> b\n");
+  });
+
+  it("returns a clean released checkout to its trunk through gt and leaves a dirty one", async () => {
+    const fleet = await makeFleet(["a", "b"]);
+    expect(fleet.orch("slot", "claim", "u1").stdout).toBe("u1 -> a\n");
+    expect(fleet.orch("slot", "claim", "u2").stdout).toBe("u2 -> b\n");
+    git({ repo: fleet.path("a"), args: ["switch", "--quiet", "-c", "feat"] });
+    git({ repo: fleet.path("b"), args: ["switch", "--quiet", "-c", "wip"] });
+    await writeFile(join(fleet.path("b"), "scratch.txt"), "wip\n");
+
+    expect(fleet.orch("slot", "release", "u1").stdout).toBe(
+      "released a (was u1); switched feat -> main\n"
+    );
+    expect(git({ repo: fleet.path("a"), args: ["branch", "--show-current"] })).toBe(
+      "main"
+    );
+    expect(fleet.orch("slot", "release", "b").stdout).toBe(
+      "released b (was u2); left on wip: uncommitted changes; claim will skip it until it is back on main\n"
+    );
+    expect(git({ repo: fleet.path("b"), args: ["branch", "--show-current"] })).toBe(
+      "wip"
+    );
+    expect(fleet.orch("slot", "release", "a").stdout).toBe(
+      "released a (was free)\n"
+    );
+    expect(fleet.orch("slot", "release", "u1").stdout).toBe(
+      "u1 holds no slot\n"
+    );
+    expect(fleet.orch("slot", "release", "nobody").code).toBe(2);
+    expect(fleet.orch("slot", "claim", "u3").stdout).toBe("u3 -> a\n");
+    expect(await slotRows(fleet)).toBe(
+      `${SLOT_HEADER}a\t${fleet.path("a")}\tmain\t\t\t\t\tu3\t<since>\nb\t${fleet.path("b")}\tmain\t\t\t\t\t\t\n`
+    );
+  });
+
+  it("reports a failed gt checkout and leaves the slot free", async () => {
+    const fleet = await makeFleet(["a"]);
+    await writeFile(
+      join(fleet.bin, "gt"),
+      "#!/usr/bin/env bash\necho 'gt: not tracked' >&2\nexit 1\n",
+      { mode: 0o755 }
+    );
+    expect(fleet.orch("slot", "claim", "u1").stdout).toBe("u1 -> a\n");
+    git({ repo: fleet.path("a"), args: ["switch", "--quiet", "-c", "feat"] });
+
+    expect(fleet.orch("slot", "release", "u1").stdout).toMatch(
+      /^released a \(was u1\); left on feat: gt checkout main failed: Command failed: gt /
+    );
+    expect(await slotRows(fleet)).toBe(
+      `${SLOT_HEADER}a\t${fleet.path("a")}\tmain\t\t\t\t\t\t\n`
+    );
+  });
+
+  it("upserts config fields idempotently without touching the holder", async () => {
+    const fleet = await makeFleet(["a"]);
+    expect(fleet.orch("slot", "claim", "u1").stdout).toBe("u1 -> a\n");
+    const add = [
+      "slot",
+      "add",
+      "a",
+      "--path",
+      fleet.path("a"),
+      "--driver",
+      "verify-app",
+      "--probe",
+      "13000",
+      "--note",
+      "next=13000 db=app_1",
+    ];
+    expect(fleet.orch(...add).stdout).toMatch(
+      new RegExp(`^a\\t${fleet.path("a")}\\tmain\\tu1 since \\S+\\n$`)
+    );
+    const once = await readFile(join(fleet.store, "slots.tsv"), "utf8");
+    expect(fleet.orch(...add).code).toBe(0);
+    expect(fleet.orch("slot", "add", "a", "--path", fleet.path("a")).code).toBe(
+      0
+    );
+    expect(await readFile(join(fleet.store, "slots.tsv"), "utf8")).toBe(once);
+    expect(await slotRows(fleet)).toBe(
+      `${SLOT_HEADER}a\t${fleet.path("a")}\tmain\tverify-app\t13000\tnext=13000 db=app_1\t\tu1\t<since>\n`
+    );
+
+    expect(
+      fleet.orch("slot", "add", "a", "--path", fleet.path("a"), "--note", "a\tb")
+        .stderr
+    ).toStartWith("error: note must not contain tabs or newlines\n");
+    expect(
+      fleet.orch("slot", "add", "x", "--path", fleet.directory).stderr
+    ).toStartWith(`error: path ${fleet.directory} is not a git work tree\n`);
+    expect(fleet.orch("slot", "remove", "a").stderr).toStartWith(
+      "error: slot a is held; only a free slot can be removed\n"
+    );
+  });
+
+  it("prints a brief with the slot fields and the standing orders verbatim", async () => {
+    const fleet = await makeFleet(["a"]);
+    fleet.orch("slot", "add", "a", "--path", fleet.path("a"), "--note", "db=app_1");
+    fleet.orch("standing", "add", "Never push to main.");
+    fleet.orch("standing", "add", "Run the verify skill before reporting.");
+
+    expect(fleet.orch("slot", "brief", "u1").stderr).toBe(
+      "error: unit u1 holds no slot; claim one first\n"
+    );
+    expect(fleet.orch("slot", "claim", "u1").stdout).toBe("u1 -> a\n");
+    expect(fleet.orch("slot", "brief", "u1").stdout).toBe(
+      `SLOT a
+CHECKOUT ${fleet.path("a")}
+TRUNK main
+NOTE db=app_1
+
+STANDING ORDERS (verbatim)
+1. Never push to main.
+2. Run the verify skill before reporting.
+`
+    );
+  });
+
+  it("lists live branch, dirty count, commits behind, probe, and holder", async () => {
+    const fleet = await makeFleet(["a", "b"]);
+    const server = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: { data: () => {} },
+    });
+    try {
+      fleet.orch("slot", "add", "a", "--path", fleet.path("a"), "--probe", String(server.port));
+      fleet.orch("slot", "reserve", "b", "pinned");
+      await writeFile(join(fleet.path("a"), "scratch.txt"), "wip\n");
+      await writeFile(join(fleet.origin, "next.txt"), "next\n");
+      git({ repo: fleet.origin, args: ["add", "."] });
+      git({ repo: fleet.origin, args: ["commit", "-m", "next"] });
+
+      expect(fleet.orch("slot", "list").stdout).toBe(
+        "a\tmain\t1\t0\tup\tfree\nb\tmain\t0\t0\t-\tRESERVED: pinned\n"
+      );
+      expect(fleet.orch("slot", "list", "--fetch").stdout).toBe(
+        "a\tmain\t1\t1\tup\tfree\nb\tmain\t0\t1\t-\tRESERVED: pinned\n"
+      );
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("keeps an older store without slots.tsv working", async () => {
+    const fleet = await makeFleet([]);
+    await rm(join(fleet.store, "slots.tsv"));
+
+    expect(fleet.orch("unit", "list").stdout).toBe(
+      "u1\tbuild\tpending\t\t\t\t\nu2\tbuild\tpending\t\t\t\t\nu3\tbuild\tpending\t\t\t\t\n"
+    );
+    const status = fleet.orch("status");
+    expect(status.code).toBe(0);
+    expect(status.stdout).not.toContain("slots:");
+    expect(fleet.orch("slot", "list").stdout).toBe("(no slots)\n");
+
+    git({ repo: fleet.directory, args: ["clone", "--quiet", fleet.origin, "a"] });
+    expect(fleet.orch("slot", "add", "a", "--path", fleet.path("a")).code).toBe(0);
+    expect(await slotRows(fleet)).toBe(
+      `${SLOT_HEADER}a\t${fleet.path("a")}\tmain\t\t\t\t\t\t\n`
+    );
+    expect(fleet.orch("status").stdout).toContain(
+      "\nslots: 0 held, 1 free, 0 reserved\n"
+    );
+  });
+
+  it("rejects slot rows that break the holder invariants", async () => {
+    const fleet = await makeFleet([]);
+    const write = (rows: string) =>
+      writeFile(join(fleet.store, "slots.tsv"), `${SLOT_HEADER}${rows}`);
+
+    await write("a\t/x\tmain\t\t\t\tpinned\tu1\t2026-01-01T00:00:00.000Z\n");
+    expect(fleet.orch("slot", "list").stderr).toStartWith(
+      "error: slots.tsv has an invalid holder for slot a\n"
+    );
+    await write("a\t/x\tmain\t\t\t\t\tu1\t\n");
+    expect(fleet.orch("slot", "list").stderr).toStartWith(
+      "error: slots.tsv has an invalid holder for slot a\n"
+    );
+    await write(
+      "a\t/x\tmain\t\t\t\t\tu1\tnow\nb\t/y\tmain\t\t\t\t\tu1\tnow\n"
+    );
+    expect(fleet.orch("slot", "list").stderr).toStartWith(
+      "error: slots.tsv has a unit holding more than one slot\n"
+    );
+    await write("a\t/x\tmain\t\t\t\t\t\t\na\t/y\tmain\t\t\t\t\t\t\n");
+    expect(fleet.orch("slot", "list").stderr).toStartWith(
+      "error: slots.tsv has duplicate slot names\n"
+    );
+    await write("a\t/x\tmain\t\t99999\t\t\t\t\n");
+    expect(fleet.orch("slot", "list").stderr).toStartWith(
+      "error: probe must be a TCP port from 1 to 65535\n"
+    );
+  });
 });

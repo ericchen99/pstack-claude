@@ -10,6 +10,10 @@ import {
   type Frontier,
   type InboxPointer,
   type OpenGate,
+  type Slot,
+  type SlotBrief,
+  type SlotRelease,
+  type SlotView,
   type StandingLine,
   type StatusReport,
   type Store,
@@ -84,6 +88,23 @@ interface FrontierSetOptions {
   readonly prs?: readonly number[];
 }
 
+interface SlotAddOptions {
+  readonly path: string;
+  readonly trunk?: string;
+  readonly driver?: string;
+  readonly probe?: number;
+  readonly note?: string;
+}
+
+interface SlotListOptions {
+  readonly fetch: boolean;
+}
+
+interface SlotClaimOptions {
+  readonly slot?: string;
+  readonly allowDirty: boolean;
+}
+
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -92,6 +113,14 @@ function positiveInteger(value: string): number {
   const parsed = Number(value);
   if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(parsed)) {
     throw new InvalidArgumentError("must be a positive integer");
+  }
+  return parsed;
+}
+
+function tcpPort(value: string): number {
+  const parsed = positiveInteger(value);
+  if (parsed > 65535) {
+    throw new InvalidArgumentError("must be a TCP port from 1 to 65535");
   }
   return parsed;
 }
@@ -172,6 +201,86 @@ function frontierLine(value: Frontier): string {
   return `generation=${value.generation} prs=${prs} lowest-unmerged=${value.lowestUnmerged ?? "none"}`;
 }
 
+function holderText(row: Slot): string {
+  switch (row.hold.kind) {
+    case "reserved":
+      return `RESERVED: ${row.hold.reason}`;
+    case "held":
+      return `${row.hold.unit} since ${row.hold.since}`;
+    case "free":
+      return "free";
+  }
+}
+
+function slotLine(row: Slot): string {
+  return [row.slot, row.path, row.trunk, holderText(row)].join("\t");
+}
+
+function slotViewLine(view: SlotView): string {
+  return [
+    view.slot.slot,
+    view.branch ?? "?",
+    view.dirty ?? "?",
+    view.behind ?? "?",
+    view.probe ?? "-",
+    holderText(view.slot),
+  ].join("\t");
+}
+
+function releaseLine(result: SlotRelease): string {
+  if (result.kind === "unheld") {
+    return `${result.unit} holds no slot`;
+  }
+  const { slot, trunk } = result.slot;
+  const released = `released ${slot} (was ${result.was ?? "free"})`;
+  const outcome = result.checkout;
+  switch (outcome.kind) {
+    case "on-trunk":
+      return released;
+    case "kept-reserved":
+      return `${released}; reserved, so left on its current branch`;
+    case "unreadable":
+      return `${released}; checkout at ${result.slot.path} is not readable`;
+    case "switched":
+      return `${released}; switched ${outcome.from} -> ${trunk}`;
+    case "dirty":
+      return `${released}; left on ${outcome.branch}: uncommitted changes; claim will skip it until it is back on ${trunk}`;
+    case "gt-failed":
+      return `${released}; left on ${outcome.branch}: gt checkout ${trunk} failed: ${outcome.error.split("\n")[0] ?? ""}`;
+  }
+}
+
+function briefLines(brief: SlotBrief): string {
+  const fields: readonly (readonly [string, string])[] = [
+    ["SLOT", brief.slot],
+    ["CHECKOUT", brief.checkout],
+    ["TRUNK", brief.trunk],
+    ["NOTE", brief.note],
+    ["DRIVER", brief.driver],
+  ];
+  return [
+    ...fields
+      .filter(([, value]) => value.length > 0)
+      .map(([label, value]) => `${label} ${value}`),
+    "",
+    "STANDING ORDERS (verbatim)",
+    brief.standing.length === 0
+      ? "(no standing orders)"
+      : brief.standing.map((item) => `${item.number}. ${item.line}`).join("\n"),
+  ].join("\n");
+}
+
+function slotCountLines(rows: readonly Slot[]): readonly string[] {
+  if (rows.length === 0) {
+    return [];
+  }
+  const count = (kind: Slot["hold"]["kind"]): number =>
+    rows.filter((row) => row.hold.kind === kind).length;
+  return [
+    `slots: ${count("held")} held, ${count("free")} free, ${count("reserved")} reserved`,
+  ];
+}
+
 function statusLines(report: StatusReport): string {
   const visible = report.summary.openGateIds.slice(0, DISPLAY_LIMIT);
   const more =
@@ -184,6 +293,7 @@ function statusLines(report: StatusReport): string {
     `gates open: ${report.summary.openGateIds.length}${
       visible.length > 0 ? `; ids=${visible.join(",")}${more}` : ""
     }`,
+    ...slotCountLines(report.slots),
   ].join("\n");
 }
 
@@ -530,6 +640,89 @@ function createProgram(io: Io): Command {
       (store) => store.standing.add({ line }),
       (item) => `${item.number}. ${item.line}`
     )
+  );
+
+  const slot = program
+    .command("slot")
+    .description("manage fixed checkouts that each hold at most one unit")
+    .action(() => requireSubcommand(program));
+  leaf(slot, "add <name>", "add a slot or update its config fields")
+    .requiredOption("--path <dir>", "git work tree the slot hands out")
+    .option("--trunk <branch>", "branch a free slot sits on (default main)")
+    .option("--driver <skill>", "skill the brief names for runtime checks")
+    .option("--probe <port>", "TCP port that is up while the slot runs", tcpPort)
+    .option("--note <text>", "free text for the brief")
+    .action((name: string, options: SlotAddOptions) =>
+      runStore(
+        program,
+        io,
+        (store) => store.slots.add({ slot: name, ...options }),
+        slotLine
+      )
+    );
+  leaf(slot, "remove <name>", "remove a free, unreserved slot").action(
+    (name: string) =>
+      runStore(
+        program,
+        io,
+        (store) => store.slots.remove(name),
+        (row) => `removed ${row.slot}`
+      )
+  );
+  leaf(slot, "list", "show each slot's live git state and holder")
+    .option("--fetch", "fetch origin <trunk> in each slot first", false)
+    .action((options: SlotListOptions) =>
+      runStore(
+        program,
+        io,
+        (store) => store.slots.list(options),
+        (rows) => compactRows(rows, slotViewLine, "(no slots)", null)
+      )
+    );
+  leaf(slot, "claim <unit>", "hand a free, clean slot on its trunk to a unit")
+    .option("--slot <name>", "claim this slot or say why not")
+    .option("--allow-dirty", "accept a slot with uncommitted changes", false)
+    .action((unitId: string, options: SlotClaimOptions) =>
+      runStore(
+        program,
+        io,
+        (store) =>
+          store.slots.claim({
+            unit: unitId,
+            slot: options.slot,
+            allowDirty: options.allowDirty,
+          }),
+        (result) => `${result.unit} -> ${result.slot.slot}`
+      )
+    );
+  leaf(
+    slot,
+    "release <target>",
+    "free the slot named or held by <target> and return a clean checkout to its trunk"
+  ).action((target: string) =>
+    runStore(program, io, (store) => store.slots.release(target), releaseLine)
+  );
+  leaf(slot, "reserve <name> <reason>", "keep a slot out of rotation").action(
+    (name: string, reason: string) =>
+      runStore(
+        program,
+        io,
+        (store) => store.slots.reserve({ slot: name, reason }),
+        (row) => `${row.slot} reserved: ${reason}`
+      )
+  );
+  leaf(slot, "unreserve <name>", "put a reserved slot back in rotation").action(
+    (name: string) =>
+      runStore(
+        program,
+        io,
+        (store) => store.slots.unreserve(name),
+        (row) => `${row.slot} back in rotation`
+      )
+  );
+  leaf(slot, "brief <unit>", "print the slot block for a worker brief").action(
+    (unitId: string) =>
+      runStore(program, io, (store) => store.slots.brief(unitId), briefLines)
   );
 
   program.action(() => requireSubcommand(program));
